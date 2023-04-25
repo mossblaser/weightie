@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weightie"
+version = "0.0.1"
+license = {file= "LICENSE"}
+dependencies = [
+    "numpy",
+    "requests",
+]
+
+[tool.mypy]
+plugins = "numpy.typing.mypy_plugin"
