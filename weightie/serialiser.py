@@ -28,12 +28,14 @@ everything needed to wrap this in an array.
 """
 
 
-from typing import NamedTuple, IO, Any, cast
+from typing import NamedTuple, BinaryIO, IO, Any, cast
 
 import pickle
 import struct
 import platform
 import mmap
+import io
+import os
 
 import numpy as np
 from numpy.typing import NDArray
@@ -52,83 +54,78 @@ class _NDArrayOffset(NamedTuple):
     dtype: np.dtype
 
 
-def _dump_and_substitute_arrays(
-    data: Any,
-    file: IO[bytes],
-    alignment: int,
-) -> Any:
-    """
-    Given a NamedTuple-style container of numpy arrays and other generic Python
-    values, return a new NamedTuple of the same type but with all NDArrays
-    replaced with _NDArrayOffset objects and the array data written to the
-    provided file.
-    """
-    if isinstance(data, np.ndarray):
-        # Pad to multiple of required alignment as necessary
-        cur_offset = file.tell()
-        offset = ((cur_offset + alignment - 1) // alignment) * alignment
-        file.write(b"\0" * (offset - cur_offset))
+class Pickler(pickle.Pickler):
+    def __init__(self, file: BinaryIO, alignment: int) -> None:
+        # We'll write raw Numpy data to this file during pickling and then
+        # later append the other Pickled data...
+        self._real_file = file
+        self._alignment = alignment
 
-        # Write the array
-        file.write(data.tobytes())
+        # ... which we'll have Pickle write into this BytesIO.
+        self._pickled_file = io.BytesIO()
+        super().__init__(self._pickled_file)
 
-        return _NDArrayOffset(
-            offset=offset,
-            shape=data.shape,
-            dtype=data.dtype,
-        )
-    elif isinstance(data, (tuple, list)):
-        if hasattr(type(data), "_make"):
-            # A NamedTuple
-            make_t = type(data)._make  # type: ignore
+    def dump(self, obj: Any) -> None:
+        super().dump(obj)
+        self._pickled_file
+
+        # Append the Pickled data (and length)
+        pickled_data = self._pickled_file.getbuffer()
+        self._real_file.write(pickled_data)
+        self._real_file.write(struct.pack("<I", len(pickled_data)))
+
+    def persistent_id(self, obj: Any) -> Any:
+        # Swap all Numpy arrays for _NDArrayOffsets, writing the actual data
+        # raw into the target file
+        if isinstance(obj, np.ndarray):
+            # Pad to multiple of required alignment as necessary
+            cur_offset = self._real_file.tell()
+            offset = (
+                (cur_offset + self._alignment - 1) // self._alignment
+            ) * self._alignment
+            self._real_file.write(b"\0" * (offset - cur_offset))
+
+            # Write the array data
+            self._real_file.write(obj.tobytes())
+
+            return _NDArrayOffset(
+                offset=offset,
+                shape=obj.shape,
+                dtype=obj.dtype,
+            )
         else:
-            # A regular tuple or list
-            make_t = type(data)  # type: ignore
-        return make_t(
-            _dump_and_substitute_arrays(item, file, alignment) for item in data
-        )
-    elif isinstance(data, dict):
-        return type(data)(
-            (key, _dump_and_substitute_arrays(value, file, alignment))
-            for key, value in data.items()
-        )
-    else:
-        # All other data types are serialised as-is
-        return data
+            return None
 
 
-def _load_and_substitute_arrays(data: Any, memory_map: bytearray) -> Any:
-    """
-    Inverse of _dump_and_substitute_arrays. All loaded arrays will source their
-    data directly from the passed in memory mapped region.
-    """
-    if isinstance(data, _NDArrayOffset):
+class Unpickler(pickle.Unpickler):
+    def __init__(self, file: BinaryIO) -> None:
+        # Obtain a memory map of the file (based on which we'll create Numpy
+        # arrays)
+        extra_kwargs = {}
+        if platform.system() != "Windows":
+            extra_kwargs["prot"] = mmap.PROT_READ
+        self._memory_map = mmap.mmap(file.fileno(), length=0, **extra_kwargs)
+
+        # Seek to the start of the Pickled data at the end of the file ready
+        # for unpickling...
+        pickled_data_len = struct.unpack("<I", self._memory_map[-4:])[0]
+        file.seek(-4 - pickled_data_len, os.SEEK_END)
+        super().__init__(file)
+
+    def persistent_load(self, pid: Any) -> Any:
+        assert isinstance(pid, _NDArrayOffset)
         ar = np.frombuffer(
-            buffer=memory_map,
-            offset=data.offset,
-            count=np.prod(data.shape),
-            dtype=data.dtype,
+            buffer=self._memory_map,
+            offset=pid.offset,
+            count=np.prod(pid.shape),
+            dtype=pid.dtype,
         )
         ar.flags.writeable = False
-        ar = ar.reshape(data.shape)
+        ar = ar.reshape(pid.shape)
         return ar
-    elif isinstance(data, (tuple, list)):
-        if hasattr(type(data), "_make"):
-            make_t = type(data)._make  # type: ignore
-        else:
-            make_t = type(data)  # type: ignore
-        return make_t(_load_and_substitute_arrays(item, memory_map) for item in data)
-    elif isinstance(data, dict):
-        return {
-            key: _load_and_substitute_arrays(value, memory_map)
-            for key, value in data.items()
-        }
-    else:
-        # All other data types are serialised as-is
-        return data
 
 
-def dump(data: Any, file: IO[bytes], alignment: int = 64 * 1024) -> None:
+def dump(data: Any, file: BinaryIO, alignment: int = 64 * 1024) -> None:
     """
     Dump the given weights-containing object into the provided file with Numpy
     arrays being stored with the given alignment.
@@ -149,25 +146,12 @@ def dump(data: Any, file: IO[bytes], alignment: int = 64 * 1024) -> None:
         is a multiple of the page size of many common systems and makes a
         reasonable default choice.
     """
-    data = _dump_and_substitute_arrays(data, file, alignment)
-
-    data_bytes = pickle.dumps(data)
-    file.write(data_bytes)
-    file.write(struct.pack("<I", len(data_bytes)))
+    Pickler(file, alignment).dump(data)
 
 
-def load(file: IO[bytes]) -> Any:
+def load(file: BinaryIO) -> Any:
     """
     Load a set of weights from the provided file with all arrays being memory
     mapped from the file.
     """
-    extra_kwargs = {}
-    if platform.system() != "Windows":
-        extra_kwargs["prot"] = mmap.PROT_READ
-
-    memory_map = mmap.mmap(file.fileno(), length=0, **extra_kwargs)
-
-    data_len = struct.unpack("<I", memory_map[-4:])[0]
-    data = pickle.loads(memory_map[-4 - data_len : -4])
-
-    return _load_and_substitute_arrays(data, cast(bytearray, memory_map))
+    return Unpickler(file).load()
