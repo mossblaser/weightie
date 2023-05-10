@@ -41,7 +41,7 @@ import glob
 import re
 
 from functools import partial
-from itertools import count
+from itertools import count, chain
 from collections import defaultdict
 from pathlib import Path
 from uuid import uuid4
@@ -425,14 +425,11 @@ def download(
         If not None, a list of directories to search for already downloaded
         files (in descending order of priority).
 
-        Files will be downloaded to the *lowest* priority path which is
-        writable but searched for starting with the highest priority. This
-        means that (for example) if a user and system-wide path are given (in
-        that order), downloads will prefer going to the system-wide directory
-        if possible (if write access is available).
-
         If None, the system and user data directories (using the organisation and
         package in the repository arugment) are tried.
+
+        When downloading a file, it will be downloaded to the first search path
+        (i.e. the user data dir by default).
     update : bool
         If True, always check if a new version is available to download even if
         a local version is available..
@@ -476,8 +473,13 @@ def download(
     if search_paths is None:
         author, _, name = repository.partition("/")
         search_paths = [
-            Path(platformdirs.user_data_dir(name, author)),
-            Path(platformdirs.site_data_dir(name, author)),
+            Path(d)
+            for d in chain(
+                [platformdirs.user_data_dir(name, author)],
+                platformdirs.site_data_dir(name, author, multipath=True).split(
+                    os.pathsep
+                ),
+            )
         ]
 
     if progress_callback is None:
@@ -518,36 +520,26 @@ def download(
 
         # Download files
         files_to_download = [file for file, _versioned_filename, _url in downloads]
+        download_dir = search_paths[0]
         for file, versioned_filename, url in downloads:
-            # ...into the lowest priority search path we are allowed to write to
-            for download_dir in reversed(search_paths):
-                try:
-                    download_dir.mkdir(parents=True, exist_ok=True)
-                    local_filename = download_dir / versioned_filename
-                    # NB: Atomically replace the local file with the downloaded
-                    # data, also downloading to a unique filename to ensure
-                    # that if multiple processes are trying to download the
-                    # file simultaneously they won't clash.
-                    download_filename = local_filename.with_stem(f".{uuid4()}")
-                    try:
-                        with download_filename.open("wb") as f:
-                            download_github_asset(
-                                url,
-                                f,
-                                partial(progress_callback, files_to_download, file),
-                                min_callback_interval,
-                            )
-                    except:
-                        download_filename.unlink(missing_ok=True)
-                        raise
-                    download_filename.rename(local_filename)
-                    break
-                except PermissionError:
-                    continue
-            else:
-                raise PermissionError(
-                    "Couldn't write to any directory in the search path."
-                )
+            download_dir.mkdir(parents=True, exist_ok=True)
+            local_filename = download_dir / versioned_filename
+            # NB: Atomically replace the local file with the downloaded
+            # data, also downloading to a unique filename to ensure
+            # that if multiple processes are trying to download the
+            # file simultaneously they won't clash.
+            download_filename = local_filename.with_stem(f".{uuid4()}")
+            try:
+                with download_filename.open("wb") as f:
+                    download_github_asset(
+                        url,
+                        f,
+                        partial(progress_callback, files_to_download, file),
+                        min_callback_interval,
+                    )
+                download_filename.rename(local_filename)
+            finally:
+                download_filename.unlink(missing_ok=True)
 
         files = find_downloaded_files(
             asset_filenames, parsed_target_version, search_paths

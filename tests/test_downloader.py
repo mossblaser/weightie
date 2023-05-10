@@ -652,7 +652,7 @@ class TestDownloadWeights:
             "Downloaded from: http://example.com/v1.0.0/foo.bin"
         )
 
-    def test_try_different_download_directories(
+    def test_downloads_to_first_search_path_entry(
         self,
         tmp_path: Path,
         mock_releases: Mock,
@@ -671,7 +671,6 @@ class TestDownloadWeights:
 
         for name in "abc":
             (tmp_path / name).mkdir()
-        (tmp_path / "c").chmod(0o555)  # Prevent writing to 'c'
 
         assert download(
             "foo/bar",
@@ -679,10 +678,7 @@ class TestDownloadWeights:
             "v1.5.0",
             search_paths=[tmp_path / letter for letter in "abc"],
         ) == {
-            # Should get written to 'b' since 'c' is not writeable.
-            "foo": tmp_path
-            / "b"
-            / "v1.0.0-foo",
+            "foo": tmp_path / "a" / "v1.0.0-foo",
         }
 
         # Check 'foo' was actually downloaded
@@ -692,7 +688,7 @@ class TestDownloadWeights:
         )
 
         # Check file was written
-        assert (tmp_path / "b" / "v1.0.0-foo").read_text() == (
+        assert (tmp_path / "a" / "v1.0.0-foo").read_text() == (
             "Downloaded from: http://example.com/v1.0.0/foo.bin"
         )
 
