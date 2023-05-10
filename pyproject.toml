@@ -5,12 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "weightie"
 version = "0.0.1"
+description = "Utility library for downloading and (de)serialising model weights for my little deep learning projects."
 license = {file= "LICENSE"}
 dependencies = [
     "numpy",
     "requests",
     "platformdirs",
 ]
+dynamic = ["readme"]
+
+[tool.setuptools.dynamic]
+readme = {file = ["README.md"], content-type = "text/markdown"}
 
 [tool.mypy]
 plugins = "numpy.typing.mypy_plugin"
